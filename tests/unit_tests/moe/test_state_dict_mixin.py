@@ -91,6 +91,7 @@ def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> No
             mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.gate_and_up_projs",
                 expert_sharded_weight,
+                for_checkpoint_load=True,
             )
         )
         assert len(converted) == 4
@@ -106,6 +107,7 @@ def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> No
             mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.down_projs",
                 down_weight,
+                for_checkpoint_load=True,
             )
         )
 
@@ -1037,12 +1039,12 @@ class TestConvertSingleMergedExpertToHfSplitExperts:
 
 class TestInplaceLoadViews:
     """to_hf returns non-contiguous views into the model's grouped tensor's
-    local storage whenever the source is a model DTensor with plain
+    local storage when for_checkpoint_load=True and the source is a model DTensor with plain
     (non-DTensor) per-expert splits. DCP writes safetensors data through the
     views into model storage, and ``_from_hf_w_merged_experts`` skips the
     rebuild for those native keys (the model already holds the data). Save
-    callers must materialize the views to contiguous before serializing —
-    see ``_materialize_to_hf_views_for_save`` in checkpointing.
+    callers leave for_checkpoint_load=False to receive contiguous tensors
+    without registering native keys as loaded.
 
     The mixin re-imports ``is_dtensor`` from ``state_dict_utils`` inside the
     conversion function, so patches must target that module path.
@@ -1059,7 +1061,7 @@ class TestInplaceLoadViews:
         mixin.backend.dispatcher = "mok"
         assert mixin._supports_write_through_expert_checkpoint_load is False
 
-    def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits):
+    def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits, *, for_checkpoint_load=True):
         mixin._split_experts_weights = Mock(return_value=splits)
         mixin._last_expert_ids = list(range(len(splits)))
 
@@ -1070,7 +1072,9 @@ class TestInplaceLoadViews:
             ),
             patch("nemo_automodel.components.moe.state_dict_utils.validate_dtensor_expert_sharding"),
         ):
-            return mixin._convert_single_merged_expert_to_hf_split_experts(fqn, mock_dtensor)
+            return mixin._convert_single_merged_expert_to_hf_split_experts(
+                fqn, mock_dtensor, for_checkpoint_load=for_checkpoint_load
+            )
 
     def test_inplace_load_gate_and_up_returns_views(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
@@ -1080,7 +1084,7 @@ class TestInplaceLoadViews:
         mock_dtensor = Mock()
 
         result = self._run_inplace_conversion(
-            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits, for_checkpoint_load=True
         )
 
         assert result is not None
@@ -1089,6 +1093,35 @@ class TestInplaceLoadViews:
             assert v.untyped_storage().data_ptr() == src_ptr, f"in-place view for {k} should alias model storage"
             assert not v.is_contiguous(), f"in-place view for {k} must be the strided transpose, not a copy"
         assert "model.layers.0.mlp.experts.gate_and_up_projs" in mixin._inplace_loaded_native_keys
+
+    @pytest.mark.parametrize("projection", ["gate_and_up_projs", "down_projs"])
+    def test_export_materializes_expert_tensors_without_registering_loaded_keys(self, projection):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        shape = (2, 4, 6) if projection == "gate_and_up_projs" else (2, 3, 4)
+        local_storage = torch.arange(48 if projection == "gate_and_up_projs" else 24).reshape(shape).float()
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = shape
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(
+            mixin,
+            f"model.layers.0.mlp.experts.{projection}",
+            mock_dtensor,
+            list(local_storage.unbind()),
+            for_checkpoint_load=False,
+        )
+
+        assert result is not None
+        for key, tensor in result:
+            assert tensor.is_contiguous()
+            assert tensor.untyped_storage().data_ptr() != local_storage.untyped_storage().data_ptr()
+            expert_id = int(key.split(".")[-3])
+            expected = local_storage[expert_id]
+            if projection == "gate_and_up_projs":
+                expected = expected[:, :3] if key.endswith("gate_proj.weight") else expected[:, 3:]
+            torch.testing.assert_close(tensor, expected.T)
+        assert not getattr(mixin, "_inplace_loaded_native_keys", set())
 
     def test_inplace_load_down_projs_returns_views(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
@@ -1103,7 +1136,9 @@ class TestInplaceLoadViews:
         mock_dtensor.shape = (2, 512, 1024)
         mock_dtensor.is_meta = False
 
-        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+        result = self._run_inplace_conversion(
+            mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits, for_checkpoint_load=True
+        )
 
         assert result is not None and len(result) == 2
         src_ptr = local_storage.untyped_storage().data_ptr()
@@ -1141,7 +1176,7 @@ class TestInplaceLoadViews:
         mock_dtensor = Mock()
 
         result = self._run_inplace_conversion(
-            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits, for_checkpoint_load=True
         )
 
         gate0 = next(v for k, v in result if k.endswith("0.gate_proj.weight"))
@@ -1189,7 +1224,7 @@ class TestInplaceLoadViews:
         assert result is not None
         converted = dict(result)
         for _, v in result:
-            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+            assert not v.is_contiguous(), "checkpoint destinations may reuse views of the temporary TE stack"
         for expert_id in range(2):
             torch.testing.assert_close(
                 converted[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"],
@@ -1354,7 +1389,7 @@ class TestInplaceLoadViews:
 
         assert result is not None and len(result) == 2
         for _, v in result:
-            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+            assert not v.is_contiguous(), "checkpoint destinations may reuse views of the temporary TE stack"
         assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
             "model.layers.3.mlp.experts.down_projs" not in (mixin._inplace_loaded_native_keys or set())
         )
@@ -1377,7 +1412,7 @@ class TestInplaceLoadViews:
         )
 
         assert gate_up_result is not None
-        assert all(value.is_contiguous() for _, value in gate_up_result)
+        assert all(not value.is_contiguous() for _, value in gate_up_result)
         assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
             "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
         )
